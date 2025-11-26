@@ -1,0 +1,4 @@
+github.com/lib/pq v1.10.9 h1:YXG7RB+JIjhP29X+OtkiDnYaXQwpS4JEWq7dtCCRUEw=
+github.com/lib/pq v1.10.9/go.mod h1:AlVN5x4E4T544tWzH6hKfbfQvm3HdbOxrmggDNAPY9o=
+github.com/visvasity/kv v0.0.0-20250923164200-3ddade712f3f h1:EhAo9Of7btl6JoSN2vi8UyGvuzOI1hKOf78+dDr/1m8=
+github.com/visvasity/kv v0.0.0-20250923164200-3ddade712f3f/go.mod h1:CZqPYUOKOBKISPpVXqWdRQJQqxRT3n9//U9PULXfpbY=
