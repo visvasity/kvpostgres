@@ -1,8 +1,12 @@
-module github.com/visvasity/kvpostgress
+module github.com/visvasity/kvpostgres
 
-go 1.23.0
+go 1.23.2
+
+toolchain go1.24.10
 
 require (
 	github.com/lib/pq v1.10.9
-	github.com/visvasity/kv v0.0.0-20250923164200-3ddade712f3f
+	github.com/visvasity/kv v0.0.0-20251127181103-190fe23c8632
+	github.com/visvasity/kvbenchmarks v0.0.0-20251127232144-576c8be569f7
+	github.com/visvasity/kvtests v0.0.0-20251127231113-ed5b44ddeab6
 )

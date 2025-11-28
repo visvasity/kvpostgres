@@ -5,6 +5,7 @@ package kvpostgres
 import (
 	"context"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -17,7 +18,10 @@ func TestReadWriteConflict(t *testing.T) {
 
 	// TODO: Start a private postgres instance in a temp directory.
 
-	pg, err := New(ctx, "user=postgres dbname=default host=/tmp/", nil)
+	dbDir := filepath.Join(t.TempDir(), "database")
+	t.Log("using database dir", dbDir)
+
+	pg, err := New(ctx, dbDir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

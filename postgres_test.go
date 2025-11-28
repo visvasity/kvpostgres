@@ -4,37 +4,41 @@ package kvpostgres
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/lib/pq"
 )
 
-func TestConnect(t *testing.T) {
-	name := "user=postgres dbname=default host=/tmp/"
-	connector, err := pq.NewConnector(name)
+func TestNew(t *testing.T) {
+	ctx := context.Background()
+
+	dbDir := filepath.Join(t.TempDir(), "database")
+	t.Log("using database dir", dbDir)
+
+	db, err := New(ctx, dbDir, nil)
 	if err != nil {
-		fmt.Println(err)
-		return
+		t.Fatal(err)
 	}
-	db := sql.OpenDB(connector)
 	defer db.Close()
 
 	// Use the DB
-	txn, err := db.Begin()
+	txn, err := db.NewTransaction(ctx)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	txn.Rollback()
+	txn.Rollback(ctx)
 }
 
 func TestBasic(t *testing.T) {
 	ctx := context.Background()
-	db, err := New(ctx, "user=postgres dbname=default host=/tmp/", nil)
+
+	dbDir := filepath.Join(t.TempDir(), "database")
+	t.Log("using database dir", dbDir)
+
+	db, err := New(ctx, dbDir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

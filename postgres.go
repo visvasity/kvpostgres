@@ -10,14 +10,18 @@ import (
 	"io"
 	"iter"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/lib/pq"
 )
 
+const defaultDB = "kvs"
+
 type DB struct {
 	db      *sql.DB
 	checker func(string) bool
+	stopf   func()
 }
 
 type Tx struct {
@@ -25,18 +29,22 @@ type Tx struct {
 	tx *sql.Tx
 }
 
-type Iter struct {
-	err   error
-	key   string
-	value io.Reader
-
-	tx *Tx
-
-	rs *sql.Rows
-}
-
 // New creates a key-value store backed by an sqlite database.
-func New(ctx context.Context, cs string, checker func(string) bool) (_ *DB, status error) {
+func New(ctx context.Context, dataDir string, checker func(string) bool) (_ *DB, status error) {
+	if !filepath.IsAbs(dataDir) {
+		absDir, err := filepath.Abs(dataDir)
+		if err != nil {
+			return nil, err
+		}
+		dataDir = absDir
+	}
+
+	stopf, err := Start(ctx, dataDir, "" /* pgctlBinary */)
+	if err != nil {
+		return nil, err
+	}
+
+	cs := fmt.Sprintf("user=postgres dbname=%s host=%s", defaultDB, dataDir)
 	connector, err := pq.NewConnector(cs)
 	if err != nil {
 		return nil, err
@@ -55,11 +63,18 @@ func New(ctx context.Context, cs string, checker func(string) bool) (_ *DB, stat
 	d := &DB{
 		db:      db,
 		checker: checker,
+		stopf:   stopf,
 	}
 	return d, nil
 }
 
+// Close shuts down the postgres database server.
 func (d *DB) Close() error {
+	if d.stopf == nil {
+		return os.ErrClosed
+	}
+	d.stopf()
+	d.stopf = nil
 	return nil
 }
 
@@ -73,9 +88,17 @@ func (d *DB) checkKey(k string) bool {
 	return d.checker(k)
 }
 
+// NewSnapshot creates a read-only snapshot of the key-value database.
 func (d *DB) NewSnapshot(ctx context.Context) (*Tx, error) {
-	tx, err := d.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := d.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable, ReadOnly: true})
 	if err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.ExecContext(ctx, "SET LOCAL lock_timeout = '1s'"); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
 		return nil, err
 	}
 
@@ -112,7 +135,7 @@ func (d *DB) NewTransaction(ctx context.Context) (*Tx, error) {
 // Commit commits a transaction.
 func (t *Tx) Commit(ctx context.Context) error {
 	if t.tx == nil {
-		return sql.ErrTxDone
+		return os.ErrClosed
 	}
 	defer func() {
 		t.tx = nil
@@ -127,7 +150,7 @@ func (t *Tx) Commit(ctx context.Context) error {
 // Rollback drops a transaction.
 func (t *Tx) Rollback(ctx context.Context) error {
 	if t.tx == nil {
-		return sql.ErrTxDone
+		return os.ErrClosed
 	}
 	defer func() {
 		t.tx = nil
@@ -141,6 +164,9 @@ func (t *Tx) Rollback(ctx context.Context) error {
 
 // Get returns the value for a given key.
 func (t *Tx) Get(ctx context.Context, k string) (io.Reader, error) {
+	if t.tx == nil {
+		return nil, os.ErrClosed
+	}
 	if !t.db.checkKey(k) {
 		return nil, os.ErrInvalid
 	}
@@ -160,8 +186,11 @@ func (t *Tx) Get(ctx context.Context, k string) (io.Reader, error) {
 
 // Set creates or updates a key-value pair.
 func (t *Tx) Set(ctx context.Context, k string, v io.Reader) error {
-	if t.db == nil {
-		return sql.ErrTxDone
+	if v == nil {
+		return os.ErrInvalid
+	}
+	if t.tx == nil {
+		return os.ErrClosed
 	}
 	if !t.db.checkKey(k) {
 		return os.ErrInvalid
@@ -179,8 +208,8 @@ func (t *Tx) Set(ctx context.Context, k string, v io.Reader) error {
 
 // Delete removes a key-value pair.
 func (t *Tx) Delete(ctx context.Context, k string) error {
-	if t.db == nil {
-		return sql.ErrTxDone
+	if t.tx == nil {
+		return os.ErrClosed
 	}
 	if !t.db.checkKey(k) {
 		return os.ErrInvalid
@@ -211,6 +240,10 @@ func (t *Tx) Delete(ctx context.Context, k string) error {
 // Ascend returns key-value pairs in a given range, in ascending order.
 func (t *Tx) Ascend(ctx context.Context, beg, end string, errp *error) iter.Seq2[string, io.Reader] {
 	return func(yield func(string, io.Reader) bool) {
+		if t.tx == nil {
+			*errp = os.ErrClosed
+			return
+		}
 		if beg > end && end != "" {
 			*errp = os.ErrInvalid
 			return
@@ -264,6 +297,10 @@ func (t *Tx) Ascend(ctx context.Context, beg, end string, errp *error) iter.Seq2
 // Descend returns key-value pairs in a given range, in descending order.
 func (t *Tx) Descend(ctx context.Context, beg, end string, errp *error) iter.Seq2[string, io.Reader] {
 	return func(yield func(string, io.Reader) bool) {
+		if t.tx == nil {
+			*errp = os.ErrClosed
+			return
+		}
 		if beg > end && end != "" {
 			*errp = os.ErrInvalid
 			return
