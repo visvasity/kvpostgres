@@ -12,25 +12,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/lib/pq"
 )
 
 const defaultDB = "kvs"
 
-type DB struct {
-	db      *sql.DB
-	checker func(string) bool
-	stopf   func()
+type Database struct {
+	db    *sql.DB
+	stopf func()
 }
 
-type Tx struct {
-	db *DB
+type Transaction struct {
+	db *Database
 	tx *sql.Tx
 }
 
-// New creates a key-value store backed by an sqlite database.
-func New(ctx context.Context, dataDir string, checker func(string) bool) (_ *DB, status error) {
+// New creates a key-value store (if it doesn't exist) backed by a private
+// postgres instance.
+func New(ctx context.Context, dataDir string) (_ *Database, status error) {
 	if !filepath.IsAbs(dataDir) {
 		absDir, err := filepath.Abs(dataDir)
 		if err != nil {
@@ -39,7 +40,7 @@ func New(ctx context.Context, dataDir string, checker func(string) bool) (_ *DB,
 		dataDir = absDir
 	}
 
-	stopf, err := Start(ctx, dataDir, "" /* pgctlBinary */)
+	stopf, err := Start(ctx, dataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -60,49 +61,60 @@ func New(ctx context.Context, dataDir string, checker func(string) bool) (_ *DB,
 	if _, err := db.ExecContext(ctx, q); err != nil {
 		return nil, err
 	}
-	d := &DB{
-		db:      db,
-		checker: checker,
-		stopf:   stopf,
+	d := &Database{
+		db:    db,
+		stopf: stopf,
+	}
+	return d, nil
+}
+
+// Connect creates a db instance using an already running database server at
+// the given directory.
+func Connect(ctx context.Context, dataDir string) (_ *Database, status error) {
+	cs := fmt.Sprintf("user=postgres dbname=%s host=%s", defaultDB, dataDir)
+	connector, err := pq.NewConnector(cs)
+	if err != nil {
+		return nil, err
+	}
+	db := sql.OpenDB(connector)
+	defer func() {
+		if status != nil {
+			_ = db.Close()
+		}
+	}()
+
+	q := fmt.Sprintf("CREATE TABLE IF NOT EXISTS kv (key BYTEA PRIMARY KEY, value BYTEA)")
+	if _, err := db.ExecContext(ctx, q); err != nil {
+		return nil, err
+	}
+	d := &Database{
+		db: db,
 	}
 	return d, nil
 }
 
 // Close shuts down the postgres database server.
-func (d *DB) Close() error {
-	if d.stopf == nil {
-		return os.ErrClosed
+func (d *Database) Close() error {
+	if d.stopf != nil {
+		d.stopf()
+		d.stopf = nil
 	}
-	d.stopf()
-	d.stopf = nil
 	return nil
 }
 
-func (d *DB) checkKey(k string) bool {
-	if len(k) == 0 {
-		return false
-	}
-	if d.checker == nil {
-		return true
-	}
-	return d.checker(k)
-}
-
 // NewSnapshot creates a read-only snapshot of the key-value database.
-func (d *DB) NewSnapshot(ctx context.Context) (*Tx, error) {
-	tx, err := d.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable, ReadOnly: true})
+func (d *Database) NewSnapshot(ctx context.Context) (*Transaction, error) {
+	tx, err := d.db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable, ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
 
 	if _, err := tx.ExecContext(ctx, "SET LOCAL lock_timeout = '1s'"); err != nil {
-		return nil, err
-	}
-	if _, err := tx.ExecContext(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		tx.Rollback()
 		return nil, err
 	}
 
-	s := &Tx{
+	s := &Transaction{
 		db: d,
 		tx: tx,
 	}
@@ -110,22 +122,23 @@ func (d *DB) NewSnapshot(ctx context.Context) (*Tx, error) {
 }
 
 // Discard releases a snapshot.
-func (t *Tx) Discard(ctx context.Context) error {
-	return t.Rollback(ctx)
+func (t *Transaction) Discard(ctx context.Context) error {
+	return t.Rollback(context.Background())
 }
 
 // NewTransaction creates a new transaction.
-func (d *DB) NewTransaction(ctx context.Context) (*Tx, error) {
-	tx, err := d.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+func (d *Database) NewTransaction(ctx context.Context) (*Transaction, error) {
+	tx, err := d.db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return nil, err
 	}
 
 	if _, err := tx.ExecContext(ctx, "SET LOCAL lock_timeout = '1s'"); err != nil {
+		tx.Rollback()
 		return nil, err
 	}
 
-	t := &Tx{
+	t := &Transaction{
 		db: d,
 		tx: tx,
 	}
@@ -133,7 +146,7 @@ func (d *DB) NewTransaction(ctx context.Context) (*Tx, error) {
 }
 
 // Commit commits a transaction.
-func (t *Tx) Commit(ctx context.Context) error {
+func (t *Transaction) Commit(ctx context.Context) error {
 	if t.tx == nil {
 		return os.ErrClosed
 	}
@@ -148,7 +161,7 @@ func (t *Tx) Commit(ctx context.Context) error {
 }
 
 // Rollback drops a transaction.
-func (t *Tx) Rollback(ctx context.Context) error {
+func (t *Transaction) Rollback(ctx context.Context) error {
 	if t.tx == nil {
 		return os.ErrClosed
 	}
@@ -163,11 +176,11 @@ func (t *Tx) Rollback(ctx context.Context) error {
 }
 
 // Get returns the value for a given key.
-func (t *Tx) Get(ctx context.Context, k string) (io.Reader, error) {
+func (t *Transaction) Get(ctx context.Context, k string) (io.Reader, error) {
 	if t.tx == nil {
 		return nil, os.ErrClosed
 	}
-	if !t.db.checkKey(k) {
+	if len(k) == 0 {
 		return nil, os.ErrInvalid
 	}
 
@@ -185,14 +198,11 @@ func (t *Tx) Get(ctx context.Context, k string) (io.Reader, error) {
 }
 
 // Set creates or updates a key-value pair.
-func (t *Tx) Set(ctx context.Context, k string, v io.Reader) error {
-	if v == nil {
-		return os.ErrInvalid
-	}
+func (t *Transaction) Set(ctx context.Context, k string, v io.Reader) error {
 	if t.tx == nil {
 		return os.ErrClosed
 	}
-	if !t.db.checkKey(k) {
+	if v == nil || len(k) == 0 {
 		return os.ErrInvalid
 	}
 	s, err := io.ReadAll(v)
@@ -207,11 +217,11 @@ func (t *Tx) Set(ctx context.Context, k string, v io.Reader) error {
 }
 
 // Delete removes a key-value pair.
-func (t *Tx) Delete(ctx context.Context, k string) error {
+func (t *Transaction) Delete(ctx context.Context, k string) error {
 	if t.tx == nil {
 		return os.ErrClosed
 	}
-	if !t.db.checkKey(k) {
+	if len(k) == 0 {
 		return os.ErrInvalid
 	}
 
@@ -237,8 +247,7 @@ func (t *Tx) Delete(ctx context.Context, k string) error {
 	return nil
 }
 
-// Ascend returns key-value pairs in a given range, in ascending order.
-func (t *Tx) Ascend(ctx context.Context, beg, end string, errp *error) iter.Seq2[string, io.Reader] {
+func (t *Transaction) Ascend(ctx context.Context, beg, end string, errp *error) iter.Seq2[string, io.Reader] {
 	return func(yield func(string, io.Reader) bool) {
 		if t.tx == nil {
 			*errp = os.ErrClosed
@@ -249,41 +258,47 @@ func (t *Tx) Ascend(ctx context.Context, beg, end string, errp *error) iter.Seq2
 			return
 		}
 
-		var err error
-		var rs *sql.Rows
+		// NOTE: Cursor name cannot be passed as a value parameter using $1 syntax.
+		name := fmt.Sprintf("c%d", time.Now().UnixNano())
+		cursorPrefix := fmt.Sprintf("DECLARE %s CURSOR FOR ", name)
 
 		switch {
 		case beg == "" && end == "":
-			q := "SELECT key, value FROM kv ORDER BY key ASC"
-			rs, err = t.tx.QueryContext(ctx, q)
-
-		case beg != "" && end != "":
-			q := "SELECT key, value FROM kv WHERE key >= $1 AND key < $2 ORDER BY key ASC"
-			rs, err = t.tx.QueryContext(ctx, q, beg, end)
-
-		case beg == "" && end != "":
-			q := "SELECT key, value FROM kv WHERE key < $1 ORDER BY key ASC"
-			rs, err = t.tx.QueryContext(ctx, q, end)
-
-		case beg != "" && end == "":
-			q := "SELECT key, value FROM kv WHERE key >= $1 ORDER BY key ASC"
-			rs, err = t.tx.QueryContext(ctx, q, beg)
-		}
-
-		if err != nil {
-			*errp = err
-			return
-		}
-
-		defer rs.Close()
-
-		for rs.Next() {
-			if err := rs.Err(); err != nil {
+			q := cursorPrefix + "SELECT key, value FROM kv ORDER BY key ASC"
+			if _, err := t.tx.ExecContext(ctx, q); err != nil {
 				*errp = err
 				return
 			}
+
+		case beg != "" && end != "":
+			q := cursorPrefix + "SELECT key, value FROM kv WHERE key >= $1 AND key < $2 ORDER BY key ASC"
+			if _, err := t.tx.ExecContext(ctx, q, beg, end); err != nil {
+				*errp = err
+				return
+			}
+
+		case beg == "" && end != "":
+			q := cursorPrefix + "SELECT key, value FROM kv WHERE key < $1 ORDER BY key ASC"
+			if _, err := t.tx.ExecContext(ctx, q, end); err != nil {
+				*errp = err
+				return
+			}
+
+		case beg != "" && end == "":
+			q := cursorPrefix + "SELECT key, value FROM kv WHERE key >= $1 ORDER BY key ASC"
+			if _, err := t.tx.ExecContext(ctx, q, beg); err != nil {
+				*errp = err
+				return
+			}
+		}
+		defer t.tx.Exec("CLOSE " + name)
+
+		for {
 			var key, value string
-			if err := rs.Scan(&key, &value); err != nil {
+			if err := t.tx.QueryRowContext(ctx, `FETCH NEXT FROM `+name).Scan(&key, &value); err != nil {
+				if err == sql.ErrNoRows {
+					break
+				}
 				*errp = err
 				return
 			}
@@ -295,7 +310,7 @@ func (t *Tx) Ascend(ctx context.Context, beg, end string, errp *error) iter.Seq2
 }
 
 // Descend returns key-value pairs in a given range, in descending order.
-func (t *Tx) Descend(ctx context.Context, beg, end string, errp *error) iter.Seq2[string, io.Reader] {
+func (t *Transaction) Descend(ctx context.Context, beg, end string, errp *error) iter.Seq2[string, io.Reader] {
 	return func(yield func(string, io.Reader) bool) {
 		if t.tx == nil {
 			*errp = os.ErrClosed
@@ -306,41 +321,47 @@ func (t *Tx) Descend(ctx context.Context, beg, end string, errp *error) iter.Seq
 			return
 		}
 
-		var err error
-		var rs *sql.Rows
+		// NOTE: Cursor name cannot be passed as a value parameter using $1 syntax.
+		name := fmt.Sprintf("c%d", time.Now().UnixNano())
+		cursorPrefix := fmt.Sprintf("DECLARE %s CURSOR FOR ", name)
 
 		switch {
 		case beg == "" && end == "":
-			q := "SELECT key, value FROM kv ORDER BY key DESC"
-			rs, err = t.tx.QueryContext(ctx, q)
-
-		case beg != "" && end != "":
-			q := "SELECT key, value FROM kv WHERE key >= $1 AND key < $2 ORDER BY key DESC"
-			rs, err = t.tx.QueryContext(ctx, q, beg, end)
-
-		case beg == "" && end != "":
-			q := "SELECT key, value FROM kv WHERE key < $1 ORDER BY key DESC"
-			rs, err = t.tx.QueryContext(ctx, q, end)
-
-		case beg != "" && end == "":
-			q := "SELECT key, value FROM kv WHERE key >= $1 ORDER BY key DESC"
-			rs, err = t.tx.QueryContext(ctx, q, beg)
-		}
-
-		if err != nil {
-			*errp = err
-			return
-		}
-
-		defer rs.Close()
-
-		for rs.Next() {
-			if err := rs.Err(); err != nil {
+			q := cursorPrefix + "SELECT key, value FROM kv ORDER BY key DESC"
+			if _, err := t.tx.ExecContext(ctx, q); err != nil {
 				*errp = err
 				return
 			}
+
+		case beg != "" && end != "":
+			q := cursorPrefix + "SELECT key, value FROM kv WHERE key >= $1 AND key < $2 ORDER BY key DESC"
+			if _, err := t.tx.ExecContext(ctx, q, beg, end); err != nil {
+				*errp = err
+				return
+			}
+
+		case beg == "" && end != "":
+			q := cursorPrefix + "SELECT key, value FROM kv WHERE key < $1 ORDER BY key DESC"
+			if _, err := t.tx.ExecContext(ctx, q, end); err != nil {
+				*errp = err
+				return
+			}
+
+		case beg != "" && end == "":
+			q := cursorPrefix + "SELECT key, value FROM kv WHERE key >= $1 ORDER BY key DESC"
+			if _, err := t.tx.ExecContext(ctx, q, beg); err != nil {
+				*errp = err
+				return
+			}
+		}
+		defer t.tx.Exec("CLOSE " + name)
+
+		for {
 			var key, value string
-			if err := rs.Scan(&key, &value); err != nil {
+			if err := t.tx.QueryRowContext(ctx, `FETCH NEXT FROM `+name).Scan(&key, &value); err != nil {
+				if err == sql.ErrNoRows {
+					break
+				}
 				*errp = err
 				return
 			}

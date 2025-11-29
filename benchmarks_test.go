@@ -17,7 +17,7 @@ func BenchmarkPostgres(b *testing.B) {
 	dbDir := filepath.Join(b.TempDir(), "database")
 	b.Log("using database dir", dbDir)
 
-	pg, err := New(ctx, dbDir, nil)
+	pg, err := New(ctx, dbDir)
 	if err != nil {
 		b.Fatal(err)
 	}

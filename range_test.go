@@ -24,7 +24,7 @@ func TestAscendDescend(t *testing.T) {
 	dbDir := filepath.Join(t.TempDir(), "database")
 	t.Log("using database dir", dbDir)
 
-	pg, err := New(ctx, dbDir, nil)
+	pg, err := New(ctx, dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}

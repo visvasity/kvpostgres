@@ -3,6 +3,7 @@
 package kvpostgres
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -14,6 +15,10 @@ import (
 
 	"github.com/lib/pq"
 )
+
+// PgctlBinaryPath variable contains the path to `pg_ctl` binary. When empty
+// exec.LookPath will be used to find the binary.
+var PgctlBinaryPath = ""
 
 type pgCtl struct {
 	binPath string
@@ -57,6 +62,20 @@ func (v *pgCtl) init(ctx context.Context, dataDir string) (status error) {
 	return nil
 }
 
+func (v *pgCtl) running(ctx context.Context, dataDir string) (status error) {
+	cmd := exec.CommandContext(ctx, v.binPath, "-D", dataDir, "status")
+	slog.Info("checking if postgres database is running", "cmd", cmd.Args)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		code := cmd.ProcessState.ExitCode()
+		if code == 3 {
+			return os.ErrNotExist
+		}
+		slog.Warn("pg_ctl status command failed", "exit-code", code, "output", string(bytes.TrimSpace(out)))
+		return fmt.Errorf("pg_ctl status cmd failed with code %d: %w", code, os.ErrInvalid)
+	}
+	return nil
+}
+
 func (v *pgCtl) start(ctx context.Context, dataDir string) (status error) {
 	var cmd *exec.Cmd
 	if _, err := os.Stat(filepath.Join(dataDir, "postmaster.opts")); err == nil {
@@ -93,7 +112,7 @@ func (v *pgCtl) start(ctx context.Context, dataDir string) (status error) {
 	row := db.QueryRowContext(ctx, q, defaultDB)
 	switch err := row.Scan(); {
 	case err == sql.ErrNoRows:
-		slog.Info("default database does not exist; creating the database")
+		slog.Info("creating new database because default database does not exist", "database", defaultDB)
 		if _, err := db.ExecContext(ctx, `CREATE DATABASE `+defaultDB); err != nil {
 			return err
 		}
@@ -114,9 +133,9 @@ func (v *pgCtl) stop(dataDir string) error {
 	return nil
 }
 
-// Start initializes and starts a private postgres server in the given
-// directory.
-func Start(ctx context.Context, dataDir string, pgctlBinPath string) (func(), error) {
+// Start initializes a postgres database and starts a private postgres server
+// in the given directory if it doesn't already exist.
+func Start(ctx context.Context, dataDir string) (func(), error) {
 	if !filepath.IsAbs(dataDir) {
 		absDir, err := filepath.Abs(dataDir)
 		if err != nil {
@@ -125,26 +144,27 @@ func Start(ctx context.Context, dataDir string, pgctlBinPath string) (func(), er
 		dataDir = absDir
 	}
 
-	if len(pgctlBinPath) == 0 {
+	pgctl := PgctlBinaryPath
+	if len(pgctl) == 0 {
 		binPath, err := exec.LookPath("pg_ctl")
 		if err != nil {
 			return nil, err
 		}
-		pgctlBinPath = binPath
+		pgctl = binPath
 	}
-	if !filepath.IsAbs(pgctlBinPath) {
-		binPath, err := filepath.Abs(pgctlBinPath)
+	if !filepath.IsAbs(pgctl) {
+		binPath, err := filepath.Abs(pgctl)
 		if err != nil {
 			return nil, err
 		}
-		pgctlBinPath = binPath
+		pgctl = binPath
 	}
-	if _, err := os.Stat(pgctlBinPath); err != nil {
+	if _, err := os.Stat(pgctl); err != nil {
 		return nil, err
 	}
 
 	v := &pgCtl{
-		binPath: pgctlBinPath,
+		binPath: pgctl,
 	}
 
 	if _, err := os.Stat(dataDir); err != nil {
@@ -154,6 +174,12 @@ func Start(ctx context.Context, dataDir string, pgctlBinPath string) (func(), er
 		if err := v.init(ctx, dataDir); err != nil {
 			return nil, err
 		}
+	}
+
+	if err := v.running(ctx, dataDir); err == nil {
+		return func() {}, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
 	}
 
 	if err := v.start(ctx, dataDir); err != nil {

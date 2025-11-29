@@ -17,7 +17,7 @@ func TestNew(t *testing.T) {
 	dbDir := filepath.Join(t.TempDir(), "database")
 	t.Log("using database dir", dbDir)
 
-	db, err := New(ctx, dbDir, nil)
+	db, err := New(ctx, dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestBasic(t *testing.T) {
 	dbDir := filepath.Join(t.TempDir(), "database")
 	t.Log("using database dir", dbDir)
 
-	db, err := New(ctx, dbDir, nil)
+	db, err := New(ctx, dbDir)
 	if err != nil {
 		t.Fatal(err)
 	}
